@@ -1,0 +1,106 @@
+# Fake News Detection
+politifact:
+  task: graph
+  metric: acc
+gossipcop:
+  task: graph
+  metric: acc
+
+# Graph Classification
+zinc:
+  task: graph
+  metric: mae
+  num_tasks: 1
+zinc_full:
+  task: graph
+  metric: mae
+  num_tasks: 1
+bbbp:
+  task: graph
+  metric: auc
+  num_tasks: 1
+tox21:
+  task: graph
+  metric: auc
+  num_tasks: 12
+toxcast:
+  task: graph
+  metric: auc
+  num_tasks: 617
+sider:
+  task: graph
+  metric: auc
+  num_tasks: 27
+clintox:
+  task: graph
+  metric: auc
+  num_tasks: 2
+pcba:
+  task: graph
+  metric: ap
+  num_tasks: 128
+muv:
+  task: graph
+  metric: ap
+  num_tasks: 17
+hiv:
+  task: graph
+  metric: auc
+  num_tasks: 1
+bace:
+  task: graph
+  metric: auc
+  num_tasks: 1
+esol:
+  task: graph
+  metric: rmse
+  num_tasks: 1
+freesolv:
+  task: graph
+  metric: rmse
+  num_tasks: 1
+lipo:
+  task: graph
+  metric: rmse
+  num_tasks: 1
+mutag:
+  task: graph
+  metric: acc
+dd:
+  task: graph
+  metric: acc
+nci1:
+  task: graph
+  metric: acc
+enzymes:
+  task: graph
+  metric: acc
+#proteins:
+#  task: graph
+#  metric: acc
+collab:
+  task: graph
+  metric: acc
+imdb-b:
+  task: graph
+  metric: acc
+imdb-m:
+  task: graph
+  metric: acc
+reddit-b:
+  task: graph
+  metric: acc
+reddit-m5k:
+  task: graph
+  metric: acc
+reddit-m12k:
+  task: graph
+  metric: acc
+func:
+  task: graph
+  metric: ap
+  num_tasks: 10
+struct:
+  task: graph
+  metric: mae
+  num_tasks: 11

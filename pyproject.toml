@@ -1,0 +1,14 @@
+[project]
+name = "gpm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ogb>=1.3.6",
+    "wandb>=0.24.1",
+    "torch==2.7.0",
+    "googledrivedownloader>=1.1.0",
+    "torchmetrics>=1.8.2",
+    "einops>=0.8.2",
+]
