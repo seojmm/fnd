@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch_geometric.data import Data, InMemoryDataset
 import torch_geometric.transforms as T
 
-from data.pyg_data_loader import load_graph_task, mol_graphs
 from data.news_data_loader import FNNDataset
 from model.model import Model
 from model.agent import AgentNet
@@ -67,10 +66,7 @@ def run(params):
     params['device'] = device
     print("Use Device:", device)
 
-    if params['dataset'] in ["politifact", "gossipcop"]:
-        graph, splits = load_news_graph_task(params)
-    else:
-        graph, splits = load_graph_task(params)
+    graph, splits = load_news_graph_task(params)
         
     if isinstance(graph, Data):
         params['input_dim'] = graph.x.size(1)
@@ -78,9 +74,6 @@ def run(params):
     elif isinstance(graph, InMemoryDataset):
         params['input_dim'] = graph._data.x_feat.size(1)
         params['edge_dim'] = graph._data.e_feat.size(1) if graph._data.edge_attr is not None else 0
-        if params['dataset'] in mol_graphs:
-            params['input_dim'] = 16
-            params['edge_dim'] = 16
     elif isinstance(graph, dict):
         params['input_dim'] = graph['train']._data.x_feat.size(1)
         params['edge_dim'] = graph['train']._data.e_feat.size(1) if graph['train']._data.edge_attr is not None else 0
@@ -92,10 +85,15 @@ def run(params):
         params['output_dim'] = params['num_tasks']
     else:
         params['output_dim'] = graph.y.max().item() + 1
+        
+    preprocess = preprocess_graph
+    train = train_graph
+    eval = eval_graph
 
     # ---------------------------------------------------------
     # Agent를 사용하지 않을 때만 정적 패턴 전처리 수행
     # ---------------------------------------------------------
+    pattern_set = None
     if not params.get('use_agent', False):
         start_time = time.time()
         pattern_set = preprocess(graph, params)
@@ -158,7 +156,7 @@ def run(params):
         for epoch in range(1, params['epochs'] + 1):
             start_time = time.time()
             
-            # [수정] agent와 agent_optimizer 인자 추가 전달
+            # agent와 agent_optimizer 인자 추가 전달
             loss = train(graph, model, optimizer, agent=agent, agent_optimizer=agent_optimizer, split=split, scheduler=scheduler, params=params)
             
             end_time = time.time()
@@ -166,7 +164,7 @@ def run(params):
 
             if epoch % params['eval_every'] == 0 and params['split'] != 'pretrain':
                 start_time = time.time()
-                result = eval(graph, model, split=split, params=params)
+                result = eval(graph, model, agent=agent, split=split, params=params)
                 end_time = time.time()
                 inference_time.append(end_time - start_time)
 
@@ -243,7 +241,7 @@ def run(params):
     wandb.finish()
 
     # Clear everything
-    del graph, pattern_set, logger
+    del graph, logger
     torch.cuda.empty_cache()
     gc.collect()
 

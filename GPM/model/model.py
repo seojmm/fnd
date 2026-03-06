@@ -92,22 +92,20 @@ class Model(nn.Module):
 
     def forward(self, graph, items, params, **kwargs):
         mode = kwargs['mode']
-        
-        return self.encode_graph(graph, items, params, mode, dynamic_patterns=None)
+        dynamic_patterns = kwargs.get('dynamic_patterns', None)
+        # [수정] dynamic_nids 추가 수신
+        dynamic_nids = kwargs.get('dynamic_nids', None)
+        return self.encode_graph(graph, items, params, mode, dynamic_patterns=dynamic_patterns, dynamic_nids=dynamic_nids)
 
 
-    def encode_graph(self, graph, graphs, params, mode, dynamic_patterns=None):
+    def encode_graph(self, graph, graphs, params, mode, dynamic_patterns=None, dynamic_nids=None):
         device = get_device_from_model(self)
         feat = graph._data.x_feat.to(device)
 
-        # ---------------------------------------------------------
-        # Agent가 생성한 동적 패턴이 있으면 그것을 사용
-        # ---------------------------------------------------------
         if dynamic_patterns is not None:
-            # dynamic_patterns shape: [total_nodes, pattern_size + 1]
-            # 현재 배치(graphs)에 해당하는 패턴만 추출하여 차원(h=1) 추가
-            patterns = dynamic_patterns[graphs].unsqueeze(0).to(device) # [1, num_graphs, k]
-            nids = patterns.clone()
+            # [수정] patterns와 nids를 각각 분리하여 처리
+            patterns = dynamic_patterns.unsqueeze(0).to(device) # [1, num_graphs, k]
+            nids = dynamic_nids.unsqueeze(0).to(device)         # [1, num_graphs, k]
         else:
             # [기존 로직 보존] Inference나 Agent 미사용 시 기존 사전 추출 패턴 사용
             num_patterns = params['num_patterns']

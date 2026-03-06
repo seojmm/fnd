@@ -6,9 +6,6 @@ import torch_scatter
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
-
-from data.pyg_data_loader import mol_graphs
 from utils.eval import *
 from utils.utils import get_device_from_model, check_path
 
@@ -24,9 +21,6 @@ class PatternEncoder(nn.Module):
         self.pattern_encoder = params['pattern_encoder']
 
         self.pre_projection = nn.Linear(self.input_dim, self.hidden_dim)
-        if params['dataset'] in mol_graphs:
-            self.atom_encoder = AtomEncoder(emb_dim=16)
-            self.bond_encoder = BondEncoder(emb_dim=16)
 
         if params['pe_encoder'] in ['mean', 'gru']:
             self.pe_dim = params['pattern_size'] + 1
@@ -170,10 +164,10 @@ class PatternEncoder(nn.Module):
     def encode_graph(self, nids, feat, patterns, eids=None, e_feat=None, node_pe=None, params=None):
         device = get_device_from_model(self)
 
-        if params['dataset'] in mol_graphs:
-            feat = self.atom_encoder(feat)
-            if e_feat is not None:
-                e_feat = self.bond_encoder(e_feat)
+        # if params['dataset'] in mol_graphs:
+        #     feat = self.atom_encoder(feat)
+        #     if e_feat is not None:
+        #         e_feat = self.bond_encoder(e_feat)
 
         h, n, k = patterns.shape
 

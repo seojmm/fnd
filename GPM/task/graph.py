@@ -6,11 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ogb.linkproppred import *
-from ogb.nodeproppred import *
-
-from model.random_walk import get_patterns_for_graph
-
 from utils.eval import evaluate, evaluate_cls_all
 from utils.utils import get_device_from_model, seed_everything, check_path, get_num_params, to_millions, mask2idx
 
@@ -137,26 +132,47 @@ def train_graph(dataset, model, optimizer, agent=None, agent_optimizer=None, spl
         action_log_probs = None
         
         # ---------------------------------------------------------
-        # Step 1: Agent Pattern Sampling
+        # Step 1: Agent Pattern Sampling (미니배치 최적화)
         # ---------------------------------------------------------
         if agent is not None:
-            x_feat = dataset._data.x_feat.to(device)
-            edge_index = dataset._data.edge_index.to(device)
-            # 시간 정보가 x_feat의 마지막 차원에 있다고 가정 (데이터 구조에 따라 인덱스 조정 필요)
-            node_time = x_feat[:, -1].to(device) 
+            from torch_geometric.data import Batch
+            batch_data = Batch.from_data_list([dataset[g.item()] for g in cur_graphs]).to(device)
             
-            dynamic_patterns, action_log_probs = agent(x_feat, edge_index, node_time)
+            global_node_indices = batch_data.x.squeeze().long()
+            x_feat = dataset._data.x_feat[global_node_indices.cpu()].to(device)
+            edge_index = batch_data.edge_index
+            node_time = x_feat[:, -1] 
+            
+            # 에이전트는 미니배치 기준(0 ~ batch_nodes-1)으로 탐색
+            dynamic_patterns_batch, action_log_probs_batch = agent(x_feat, edge_index, node_time)
+
+            # [해결] 1. Feature 매핑을 위한 Global NIDs 산출
+            dynamic_nids_global = global_node_indices[dynamic_patterns_batch]
+            
+            # [해결] 2. Positional Encoding 매핑을 위한 Local Patterns 산출
+            # 각 노드가 속한 서브그래프의 시작 오프셋을 빼서 Local 인덱스로 변환
+            graph_ids = batch_data.batch[dynamic_patterns_batch]
+            offsets = batch_data.ptr[graph_ids]
+            dynamic_patterns_local = dynamic_patterns_batch - offsets
+            
+            root_node_indices = batch_data.ptr[:-1]
+            dynamic_nids = dynamic_nids_global[root_node_indices]          # [bs, k] (Global)
+            dynamic_patterns = dynamic_patterns_local[root_node_indices]   # [bs, k] (Local)
+            action_log_probs = action_log_probs_batch[root_node_indices]
 
         # ---------------------------------------------------------
-        # Step 2: Task GNN Forward (Original)
+        # Step 2: Task GNN Forward
         # ---------------------------------------------------------
-        pred, instance_emb, pattern_emb, commit_loss = model(dataset, cur_graphs, params, dynamic_patterns=dynamic_patterns, mode='train')
+        # [수정] dynamic_nids 인자 추가
+        pred, instance_emb, pattern_emb, commit_loss = model(
+            dataset, cur_graphs, params, 
+            dynamic_patterns=dynamic_patterns, dynamic_nids=dynamic_nids, mode='train'
+        )
         
-        # 인스턴스별 Loss를 계산하기 위해 reduction='none' 사용
         if y.ndim == 1:
             loss_orig_per_instance = F.cross_entropy(pred, cur_y, label_smoothing=params['label_smoothing'], reduction='none')
         else:
-            loss_orig_per_instance = multitask_cross_entropy(pred, cur_y) # (이 함수도 reduction='none' 형태로 수정 필요할 수 있음)
+            loss_orig_per_instance = multitask_cross_entropy(pred, cur_y) 
             
         loss_orig = loss_orig_per_instance.mean()
         loss = loss_orig + commit_loss
@@ -165,34 +181,29 @@ def train_graph(dataset, model, optimizer, agent=None, agent_optimizer=None, spl
         # Step 3: Causal Feature Masking & Reward Calculation
         # ---------------------------------------------------------
         if agent is not None:
-            # 현재 배치의 패턴에 포함된 노드들 추출
-            batch_patterns = dynamic_patterns[cur_graphs] # [bs, pattern_size + 1]
-            mask_nodes = torch.unique(batch_patterns)
+            # 마스킹은 무조건 Global 인덱스(nids) 기준!
+            mask_nodes = torch.unique(dynamic_nids)
             
-            # 원본 피처 백업 및 마스킹 (0으로 치환)
             orig_x_feat = dataset._data.x_feat.clone()
-            dataset._data.x_feat[mask_nodes] = 0.0
+            dataset._data.x_feat[mask_nodes.cpu()] = 0.0
             
-            # 마스킹된 상태로 Task GNN 재실행 (기울기 추적 불필요)
             with torch.no_grad():
-                pred_cf, _, _, _ = model(dataset, cur_graphs, params, dynamic_patterns=dynamic_patterns, mode='train')
+                pred_cf, _, _, _ = model(
+                    dataset, cur_graphs, params, 
+                    dynamic_patterns=dynamic_patterns, dynamic_nids=dynamic_nids, mode='train'
+                )
                 if y.ndim == 1:
                     loss_cf_per_instance = F.cross_entropy(pred_cf, cur_y, label_smoothing=params['label_smoothing'], reduction='none')
                 else:
                     loss_cf_per_instance = multitask_cross_entropy(pred_cf, cur_y)
                     
-            # 원본 피처 복구
             dataset._data.x_feat = orig_x_feat
             
-            # Reward 계산: 패턴 제거 시 Loss가 증가하면 좋은 패턴(+)
-            reward = (loss_cf_per_instance - loss_orig_per_instance).detach() # [bs]
+            reward = (loss_cf_per_instance - loss_orig_per_instance).detach() 
+            batch_log_probs = action_log_probs.sum(dim=1) 
             
-            # Agent Loss 계산: Policy Gradient (REINFORCE)
-            # 현재 배치(cur_graphs)에 해당하는 에이전트의 로그 확률 총합 계산
-            batch_log_probs = action_log_probs[cur_graphs].sum(dim=1) # [bs]
             agent_loss = -torch.mean(reward * batch_log_probs)
-            
-            loss = loss + agent_loss # Task Loss + Agent Loss 병합
+            loss = loss + agent_loss
 
         # ---------------------------------------------------------
         # Step 4: Backpropagation & Optimization
@@ -221,9 +232,13 @@ def train_graph(dataset, model, optimizer, agent=None, agent_optimizer=None, spl
     return {'train': total_loss, 'val': 0, 'test': 0} # eval은 eval_graph에서 처리됨
 
 
-def eval_graph(graph, model, split=None, params=None):
+def eval_graph(graph, model, agent=None, split=None, params=None):
     model.eval()
+    if agent is not None:
+        agent.eval()
+        
     bs = params['batch_size']
+    device = get_device_from_model(model)
 
     results = {}
     results['metric'] = params['metric']
@@ -241,21 +256,50 @@ def eval_graph(graph, model, split=None, params=None):
                 num_graphs = len(graphs)
 
             y = dataset.y[graphs]
-
             num_batches = (num_graphs + bs - 1) // bs
 
             pred_list = []
             for i in range(num_batches):
                 cur_graphs = graphs[i * bs: (i + 1) * bs]
-                pred, _, _, _ = model(dataset, cur_graphs, params, mode=key)
-                pred_list.append(pred.detach())
-            pred = torch.cat(pred_list, dim=0)
+                
+                dynamic_patterns = None
+                dynamic_nids = None
+                if agent is not None:
+                    from torch_geometric.data import Batch
+                    batch_data = Batch.from_data_list([dataset[g.item()] for g in cur_graphs]).to(device)
+                    global_node_indices = batch_data.x.squeeze().long()
+                    
+                    x_feat = dataset._data.x_feat[global_node_indices.cpu()].to(device)
+                    edge_index = batch_data.edge_index
+                    node_time = x_feat[:, -1]
+                    
+                    dynamic_patterns_batch, _ = agent(x_feat, edge_index, node_time)
+                    
+                    dynamic_nids_global = global_node_indices[dynamic_patterns_batch]
+                    graph_ids = batch_data.batch[dynamic_patterns_batch]
+                    offsets = batch_data.ptr[graph_ids]
+                    dynamic_patterns_local = dynamic_patterns_batch - offsets
+                    
+                    root_node_indices = batch_data.ptr[:-1]
+                    dynamic_nids = dynamic_nids_global[root_node_indices]
+                    dynamic_patterns = dynamic_patterns_local[root_node_indices]
 
-            value = evaluate(pred, y, params=params)
-            results[key] = value
-            cls_all = evaluate_cls_all(pred, y)
-            if cls_all is not None:
-                results[f'{key}_metrics'] = cls_all
-        
+                # [수정] dynamic_nids 인자 추가
+                pred, _, _, _ = model(
+                    dataset, cur_graphs, params, 
+                    dynamic_patterns=dynamic_patterns, dynamic_nids=dynamic_nids, mode=key
+                )
+                pred_list.append(pred.detach())
+
+            if len(pred_list) == 0:
+                results[key] = 0
+                continue
+
+            pred = torch.cat(pred_list, dim=0)
+            results[key] = evaluate(pred, y, params=params)
+
+            cls_metrics = evaluate_cls_all(pred, y)
+            if cls_metrics is not None:
+                results[f"{key}_metrics"] = cls_metrics
 
     return results

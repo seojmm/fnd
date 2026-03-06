@@ -8,6 +8,13 @@ def get_args():
     parser.add_argument("--use_params", action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--group', type=str, default='default')
+    
+    # AgentNet 및 Causal RL 관련 인자
+    parser.add_argument('--temporal_features', type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=False, help='Use temporal features (True/False)')
+    parser.add_argument('--use_agent', type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=False, help='Use AgentNet for dynamic sampling (True/False)')
+    parser.add_argument('--agent_lr', type=float, default=0.001, help='Learning rate for AgentNet')
+    parser.add_argument('--agent_weight_decay', type=float, default=1e-5, help='Weight decay for AgentNet')
+    parser.add_argument('--gumbel_temp', type=float, default=1.0, help='Temperature for Gumbel-Softmax')
 
     # Dataset
     parser.add_argument('--dataset', '--data', type=str, default="politifact")
