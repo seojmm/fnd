@@ -1,261 +1,321 @@
 import os.path as osp
+import pickle
+import sys
+from functools import cached_property
+from pathlib import Path
+from types import SimpleNamespace
 
-import torch
-from torch_geometric.data import Data
-from torch_geometric.data import InMemoryDataset
-from torch_geometric.utils import to_undirected, add_self_loops
-from torch_sparse import coalesce
-from torch_geometric.io import read_txt_array
-
-import random
 import numpy as np
 import scipy.sparse as sp
+import torch
+import torch_geometric.transforms as T
+from torch_geometric.data import Data, InMemoryDataset
+from torch_geometric.io import read_txt_array
+from torch_geometric.utils import add_self_loops, to_undirected
+from torch_sparse import coalesce
 
-"""
-    Functions to help load the graph data
-"""
+from utils.utils import idx2mask
 
-def read_file(folder, name, dtype=None):
-    path = osp.join(folder, '{}.txt'.format(name))
-    return read_txt_array(path, sep=',', dtype=dtype)
+# Allow importing scripts/cluster.py regardless of current working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = PROJECT_ROOT / 'scripts'
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.append(str(SCRIPTS_DIR))
+from cluster import build_clustered_graph
 
-
-def split(data, batch):
-    """
-    PyG util code to create graph batches
-    """
-
-    node_slice = torch.cumsum(torch.from_numpy(np.bincount(batch)), 0)
-    node_slice = torch.cat([torch.tensor([0]), node_slice])
-
-    row, _ = data.edge_index
-    edge_slice = torch.cumsum(torch.from_numpy(np.bincount(batch[row])), 0)
-    edge_slice = torch.cat([torch.tensor([0]), edge_slice])
-
-    # Edge indices should start at zero for every graph.
-    data.edge_index -= node_slice[batch[row]].unsqueeze(0)
-    data.__num_nodes__ = torch.bincount(batch).tolist()
-
-    slices = {'edge_index': edge_slice}
-    if data.x is not None:
-        slices['x'] = node_slice
-    if data.edge_attr is not None:
-        slices['edge_attr'] = edge_slice
-    if data.y is not None:
-        if data.y.size(0) == batch.size(0):
-            slices['y'] = node_slice
-        else:
-            slices['y'] = torch.arange(0, batch[-1] + 2, dtype=torch.long)
-
-    return data, slices
-
-
-def read_graph_data(folder, feature, temporal_features=False, time_mapping=None):
-    """
-    PyG util code to create PyG data instance from raw graph data.
-    Now includes temporal features integration.
-    """
-    node_attributes = sp.load_npz(folder + f'new_{feature}_feature.npz')
-    edge_index = read_file(folder, 'A', torch.long).t()
-    node_graph_id = np.load(folder + 'node_graph_id.npy')
-    graph_labels = np.load(folder + 'graph_labels.npy')
-
-    x = torch.from_numpy(node_attributes.todense()).to(torch.float)
-    
-    # Temporal features 반영
-    if temporal_features and time_mapping is not None:
-        # time_mapping이 node_index를 key로, timestamp를 value로 갖는다고 가정
-        # 실제 pkl 구조에 맞게 매핑 로직은 약간의 수정이 필요할 수 있습니다.
-        num_nodes = x.size(0)
-        time_features = torch.zeros((num_nodes, 1), dtype=torch.float)
-        
-        for i in range(num_nodes):
-            # pkl 파일의 key 형식에 따라 time_mapping[i] 부분 수정 필요
-            if i in time_mapping:
-                time_features[i, 0] = float(time_mapping[i])
-            else:
-                time_features[i, 0] = 0.0 # 누락된 시간 정보 처리
-                
-        # 기존 피처(x)에 시간 피처(time_features)를 concat
-        x = torch.cat([x, time_features], dim=-1)
-
-    node_graph_id = torch.from_numpy(node_graph_id).to(torch.long)
-    y = torch.from_numpy(graph_labels).to(torch.long)
-    _, y = y.unique(sorted=True, return_inverse=True)
-
-    num_nodes = edge_index.max().item() + 1 if x is None else x.size(0)
-    
-    # Edge Feature로 Delta T (속도 개념)를 추가하고 싶다면 여기서 계산 가능
-    edge_attr = None 
-    
-    edge_index, edge_attr = coalesce(edge_index, edge_attr, num_nodes, num_nodes)
-
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-    data, slices = split(data, node_graph_id)
-
-    return data, slices
+NEWS_DATASETS = {'politifact': 'pol', 'gossipcop': 'gos'}
 
 
 class ToUndirected:
-    def __init__(self):
-        """
-        PyG util code to transform the graph to the undirected graph
-        """
-        pass
-
     def __call__(self, data):
-        edge_attr = None
-        edge_index = to_undirected(data.edge_index, data.x.size(0))
-        num_nodes = edge_index.max().item() + 1 if data.x is None else data.x.size(0)
-        # edge_index, edge_attr = add_self_loops(edge_index, edge_attr)
-        edge_index, edge_attr = coalesce(edge_index, edge_attr, num_nodes, num_nodes)
-        data.edge_index = edge_index
-        data.edge_attr = edge_attr
+        num_nodes = data.x.size(0) if data.x is not None else int(data.edge_index.max()) + 1
+        edge_index = to_undirected(data.edge_index, num_nodes=num_nodes)
+        data.edge_index, data.edge_attr = coalesce(edge_index, None, num_nodes, num_nodes)
         return data
 
 
 class DropEdge:
     def __init__(self, tddroprate, budroprate):
         """
-        Drop edge operation from BiGCN (Rumor Detection on Social Media with Bi-Directional Graph Convolutional Networks)
-        1) Generate TD and BU edge indices
-        2) Drop out edges
-        Code from https://github.com/TianBian95/BiGCN/blob/master/Process/dataset.py
+        Drop edge operation from BiGCN (Rumor Detection on Social Media with
+        Bi-Directional Graph Convolutional Networks).
         """
         self.tddroprate = tddroprate
         self.budroprate = budroprate
 
     def __call__(self, data):
         edge_index = data.edge_index
+        num_edges = edge_index.size(1)
+        td_keep = (
+            torch.randperm(num_edges)[: int(num_edges * (1 - self.tddroprate))].sort().values
+            if self.tddroprate > 0
+            else slice(None)
+        )
+        bu_keep = (
+            torch.randperm(num_edges)[: int(num_edges * (1 - self.budroprate))].sort().values
+            if self.budroprate > 0
+            else slice(None)
+        )
 
-        if self.tddroprate > 0:
-            row = list(edge_index[0])
-            col = list(edge_index[1])
-            length = len(row)
-            poslist = random.sample(range(length), int(length * (1 - self.tddroprate)))
-            poslist = sorted(poslist)
-            row = list(np.array(row)[poslist])
-            col = list(np.array(col)[poslist])
-            new_edgeindex = [row, col]
-        else:
-            new_edgeindex = edge_index
-
-        burow = list(edge_index[1])
-        bucol = list(edge_index[0])
-        if self.budroprate > 0:
-            length = len(burow)
-            poslist = random.sample(range(length), int(length * (1 - self.budroprate)))
-            poslist = sorted(poslist)
-            row = list(np.array(burow)[poslist])
-            col = list(np.array(bucol)[poslist])
-            bunew_edgeindex = [row, col]
-        else:
-            bunew_edgeindex = [burow, bucol]
-
-        data.edge_index = torch.LongTensor(new_edgeindex)
-        data.BU_edge_index = torch.LongTensor(bunew_edgeindex)
-        data.root = torch.FloatTensor(data.x[0])
-        data.root_index = torch.LongTensor([0])
-
+        data.edge_index = edge_index[:, td_keep].long()
+        data.BU_edge_index = edge_index.flip(0)[:, bu_keep].long()
+        data.root = data.x[0].float()
+        data.root_index = torch.tensor([0], dtype=torch.long)
         return data
 
 
 class FNNDataset(InMemoryDataset):
-    r"""
-        The Graph datasets built upon FakeNewsNet data
+    r"""The graph datasets built upon FakeNewsNet data."""
 
-    Args:
-        root (string): Root directory where the dataset should be saved.
-        name (string): The `name
-            <https://chrsmrrs.github.io/datasets/docs/datasets/>`_ of the
-            dataset.
-        transform (callable, optional): A function/transform that takes in an
-            :obj:`torch_geometric.data.Data` object and returns a transformed
-            version. The data object will be transformed before every access.
-            (default: :obj:`None`)
-        pre_transform (callable, optional): A function/transform that takes in
-            an :obj:`torch_geometric.data.Data` object and returns a
-            transformed version. The data object will be transformed before
-            being saved to disk. (default: :obj:`None`)
-        pre_filter (callable, optional): A function that takes in an
-            :obj:`torch_geometric.data.Data` object and returns a boolean
-            value, indicating whether the data object should be included in the
-            final dataset. (default: :obj:`None`)
-    """
-
-    def __init__(self, root, name, feature='bert', empty=False, transform=None, pre_transform=None, pre_filter=None, temporal_features=False):
+    def __init__(self, root, name, feature='bert', empty=False, transform=None, pre_transform=None, pre_filter=None):
         self.name = name
         self.root = root
         self.feature = feature
-        self.temporal_features = temporal_features
-        super(FNNDataset, self).__init__(root, transform, pre_transform, pre_filter)
+        super().__init__(root, transform or ToUndirected(), pre_transform, pre_filter)
         if not empty:
-            self.data, self.slices, self.train_idx, self.val_idx, self.test_idx = torch.load(self.processed_paths[0], weights_only=False)
-            
+            self._data, self.node_graph_id, self.train_idx, self.val_idx, self.test_idx = torch.load(
+                self.processed_paths[0], weights_only=False
+            )
+            self._data, self.slices = self._split_graphs(self._data, self.node_graph_id)
+
+    @staticmethod
+    def _split_graphs(data, batch):
+        node_slice = torch.cumsum(torch.from_numpy(np.bincount(batch)), 0)
+        node_slice = torch.cat([torch.tensor([0]), node_slice])
+
+        row, _ = data.edge_index
+        edge_slice = torch.cumsum(torch.from_numpy(np.bincount(batch[row])), 0)
+        edge_slice = torch.cat([torch.tensor([0]), edge_slice])
+
+        data.edge_index -= node_slice[batch[row]].unsqueeze(0)
+        data.__num_nodes__ = torch.bincount(batch).tolist()
+
+        slices = {'edge_index': edge_slice}
+        if data.x is not None:
+            slices['x'] = node_slice
+        if data.edge_attr is not None:
+            slices['edge_attr'] = edge_slice
+        if data.y is not None:
+            slices['y'] = node_slice if data.y.size(0) == batch.size(0) else torch.arange(0, batch[-1] + 2, dtype=torch.long)
+
+        return data, slices
+
+    def as_indexed_dataset(self):
+        x_feat = self._data.x.float()
+        self._data.x_feat = x_feat
+        self._data.x = torch.arange(x_feat.size(0), dtype=torch.long).unsqueeze(-1)
+        self._data.e_feat = self._data.edge_attr
+        return self
+
     @property
     def raw_dir(self):
-        name = 'raw/'
-        return osp.join(self.root, self.name, name)
+        return osp.join(self.root, self.name, 'raw/')
+
+    @property
+    def num_classes(self):
+        return len(self._data.y.unique())
 
     @property
     def processed_dir(self):
-        name = 'processed/'
-        return osp.join(self.root, self.name, name)
+        return osp.join(self.root, self.name, 'processed/')
 
     @property
     def num_node_attributes(self):
-        if self.data.x is None:
-            return 0
-        return self.data.x.size(1)
+        return 0 if self._data.x is None else self._data.x.size(1)
 
     @property
     def raw_file_names(self):
-        names = ['node_graph_id', 'graph_labels']
-        return ['{}.npy'.format(name) for name in names]
+        return [f'{name}.npy' for name in ('node_graph_id', 'graph_labels')]
 
     @property
     def processed_file_names(self):
-        # 시간 피처 유무에 따라 캐싱 파일 이름을 다르게 저장하여 충돌 방지
-        temp_suffix = "_time" if self.temporal_features else ""
-        if self.pre_filter is None:
-            return f'{self.name[:3]}_data_{self.feature}{temp_suffix}.pt'
-        else:
-            return f'{self.name[:3]}_data_{self.feature}_prefiler{temp_suffix}.pt'
+        suffix = '' if self.pre_filter is None else '_prefiler'
+        return f'{self.name[:3]}_data_{self.feature}{suffix}.pt'
 
     def download(self):
         raise NotImplementedError('Must indicate valid location of raw data. No download allowed')
 
     def process(self):
-        time_mapping = None
-  
-        if self.temporal_features:
-            # pkl 파일 로드 (raw 폴더에 있다고 가정)
-            time_file_path = osp.join(self.raw_dir, 'pol_id_time_mapping (1).pkl')
-            if osp.exists(time_file_path):
-                with open(time_file_path, 'rb') as f:
-                    time_mapping = pickle.load(f)
-            else:
-                print(f"Warning: Temporal mapping file not found at {time_file_path}")
-
-        self.data, self.slices = read_graph_data(self.raw_dir, self.feature, self.temporal_features, time_mapping)
+        store = _NewsGraphStore(self.raw_dir, self.feature)
+        self._data, self.node_graph_id = store.data_bundle
 
         if self.pre_filter is not None:
             data_list = [self.get(idx) for idx in range(len(self))]
             data_list = [data for data in data_list if self.pre_filter(data)]
-            self.data, self.slices = self.collate(data_list)
+            self._data, self.slices = self.collate(data_list)
 
         if self.pre_transform is not None:
             data_list = [self.get(idx) for idx in range(len(self))]
             data_list = [self.pre_transform(data) for data in data_list]
-            self.data, self.slices = self.collate(data_list)
+            self._data, self.slices = self.collate(data_list)
 
-        # The fixed data split for benchmarking evaluation
-        # train-val-test split is 70%-10%-20%
-        self.train_idx = torch.from_numpy(np.load(self.raw_dir + 'train_idx.npy')).to(torch.long)
-        self.val_idx = torch.from_numpy(np.load(self.raw_dir + 'val_idx.npy')).to(torch.long)
-        self.test_idx = torch.from_numpy(np.load(self.raw_dir + 'test_idx.npy')).to(torch.long)
+        self.train_idx = torch.from_numpy(np.load(Path(self.raw_dir) / 'train_idx.npy')).long()
+        self.val_idx = torch.from_numpy(np.load(Path(self.raw_dir) / 'val_idx.npy')).long()
+        self.test_idx = torch.from_numpy(np.load(Path(self.raw_dir) / 'test_idx.npy')).long()
 
-        torch.save((self.data, self.slices, self.train_idx, self.val_idx, self.test_idx), self.processed_paths[0])
+        torch.save((self._data, self.node_graph_id, self.train_idx, self.val_idx, self.test_idx), self.processed_paths[0])
 
     def __repr__(self):
-        return '{}({})'.format(self.name, len(self))
+        return f'{self.name}({len(self)})'
+
+
+class ClusteredNewsDataset:
+    def __init__(self, graphs, x_feat, y):
+        self.graphs = graphs
+        self.y = y
+        self._data = SimpleNamespace(x_feat=x_feat, edge_attr=None, e_feat=None)
+
+    def __len__(self):
+        return len(self.graphs)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, torch.Tensor):
+            idx = int(idx.item())
+        return self.graphs[int(idx)]
+
+    def __iter__(self):
+        return iter(self.graphs)
+
+
+class _NewsGraphStore:
+    def __init__(self, raw_dir, feature='bert'):
+        self.raw_dir = Path(raw_dir)
+        self.feature = feature
+
+    @cached_property
+    def data_bundle(self):
+        x = torch.from_numpy(sp.load_npz(self.raw_dir / f'new_{self.feature}_feature.npz').toarray()).float()
+        edge_index = read_txt_array(str(self.raw_dir / 'A.txt'), sep=',', dtype=torch.long).t()
+        node_graph_id = torch.from_numpy(np.load(self.raw_dir / 'node_graph_id.npy')).long()
+        y = torch.from_numpy(np.load(self.raw_dir / 'graph_labels.npy')).long()
+        _, y = y.unique(sorted=True, return_inverse=True)
+
+        edge_index, edge_attr = add_self_loops(edge_index, None)
+        edge_index, edge_attr = coalesce(edge_index, edge_attr, x.size(0), x.size(0))
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y), node_graph_id
+
+    @property
+    def data(self):
+        return self.data_bundle[0]
+
+    @property
+    def node_graph_id(self):
+        return self.data_bundle[1]
+
+    @cached_property
+    def base_split(self):
+        num_graphs = self.data.y.size(0)
+        return {
+            name: idx2mask(torch.from_numpy(np.load(self.raw_dir / f'{name}_idx.npy')).long(), num_graphs)
+            for name in ('train', 'val', 'test')
+        }
+
+    @cached_property
+    def time_mapping(self):
+        prefix = NEWS_DATASETS.get(self.raw_dir.parent.name)
+        if prefix is None:
+            raise ValueError(f"Unsupported news dataset: {self.raw_dir.parent.name}")
+        with (self.raw_dir / f'{prefix}_id_time_mapping.pkl').open('rb') as handle:
+            return pickle.load(handle)
+
+    @cached_property
+    def graph_starts(self):
+        node_graph_id = self.node_graph_id.cpu().numpy()
+        return np.flatnonzero(np.r_[True, node_graph_id[1:] != node_graph_id[:-1]])
+
+    @staticmethod
+    def _cache_tag(params, feature):
+        method = params['clustering_method']
+        tag = f"{feature}_{method}_k{params['num_clusters']}"
+        if method == 'ts':
+            gamma_tag = str(params.get('time_gamma', 5.0)).replace('.', 'p')
+            tag = f"{tag}_g{gamma_tag}"
+        return tag
+
+    @staticmethod
+    def _build_pe_transform(params):
+        node_pe = params.get('node_pe', 'none')
+        node_pe_dim = params.get('node_pe_dim', 0)
+        if node_pe == 'rw' and node_pe_dim > 0:
+            return T.AddRandomWalkPE(node_pe_dim, 'pe')
+        if node_pe == 'lap' and node_pe_dim > 0:
+            return T.AddLaplacianEigenvectorPE(node_pe_dim, 'pe')
+        return None
+
+    @staticmethod
+    def _timestamp(value):
+        try:
+            return max(float(value), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def load_splits(self, split_count):
+        return [{key: value.clone() for key, value in self.base_split.items()} for _ in range(split_count)]
+
+    def extract_graph(self, graph_idx, with_timestamps=False):
+        start = int(self.graph_starts[graph_idx])
+        end = int(self.graph_starts[graph_idx + 1]) if graph_idx + 1 < len(self.graph_starts) else self.node_graph_id.numel()
+        edge_mask = (self.node_graph_id[self.data.edge_index[0]] == graph_idx) & (
+            self.node_graph_id[self.data.edge_index[1]] == graph_idx
+        )
+        timestamps = None
+        if with_timestamps:
+            lookup = self.time_mapping.get if isinstance(self.time_mapping, dict) else self.time_mapping.__getitem__
+            timestamps = torch.tensor(
+                [self._timestamp(lookup(node_id)) for node_id in range(start, end)],
+                dtype=torch.float32,
+            )
+        return self.data.x[start:end], self.data.edge_index[:, edge_mask] - start, timestamps
+
+    def load_clustered_dataset(self, params, split_count):
+        method = params['clustering_method']
+        cache_path = self.raw_dir.parent / 'processed' / (
+            f"{params['dataset'][:3]}_clustered_{self._cache_tag(params, self.feature)}.pt"
+        )
+        if cache_path.exists():
+            payload = torch.load(cache_path, weights_only=False, map_location='cpu')
+            dataset = ClusteredNewsDataset(payload['graphs'], payload['x_feat'], payload['y'])
+            splits = [{key: value.clone() for key, value in split.items()} for split in payload['splits']]
+            return dataset, splits
+
+        labels = self.data.y.clone().long()
+        transform = self._build_pe_transform(params)
+        graphs, feature_blocks, global_offset = [], [], 0
+
+        for graph_idx, label in enumerate(labels):
+            x, edge_index, timestamps = self.extract_graph(graph_idx, with_timestamps=method == 'ts')
+            graph, cluster_x_feat, _, _, _ = build_clustered_graph(x, edge_index, timestamps, params)
+            graph.x = torch.arange(global_offset, global_offset + cluster_x_feat.size(0), dtype=torch.long).unsqueeze(-1)
+            graph.y = label.view(())
+            if transform is not None:
+                graph = transform(graph)
+            graphs.append(graph)
+            feature_blocks.append(cluster_x_feat)
+            global_offset += cluster_x_feat.size(0)
+
+        x_feat = (
+            torch.cat(feature_blocks, dim=0)
+            if feature_blocks
+            else torch.empty((0, self.data.x.size(-1)), dtype=self.data.x.dtype)
+        )
+        splits = self.load_splits(split_count)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({'graphs': graphs, 'x_feat': x_feat, 'y': labels, 'splits': splits}, cache_path)
+        return ClusteredNewsDataset(graphs, x_feat, labels), self.load_splits(split_count)
+
+
+def load_fnn_dataset(params, feature='bert'):
+    split_count = params['cv_fold'] if params.get('cv_fold') is not None else params['split_repeat']
+    store = _NewsGraphStore(Path(params['data_path']) / params['dataset'] / 'raw', feature)
+    method = params.get('clustering_method', 'none')
+    if method == 'none':
+        dataset = FNNDataset(root=params['data_path'], name=params['dataset'], feature=feature).as_indexed_dataset()
+        return dataset, store.load_splits(split_count)
+    if method in {'ts', 's'}:
+        return store.load_clustered_dataset(params, split_count)
+    raise ValueError(f"Unsupported clustering_method: {method}")
+
+
+def load_visualization_graph(params, feature='bert'):
+    store = _NewsGraphStore(Path(params['data_path']) / params['dataset'] / 'raw', feature)
+    return store.extract_graph(params['graph_idx'], with_timestamps=params.get('clustering_method') == 'ts')
